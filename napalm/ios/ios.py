@@ -2793,3 +2793,1206 @@ class IOSDriver(NetworkDriver):
         if self.device and self._dest_file_system is None:
             self._dest_file_system = self._discover_file_system()
         return self._dest_file_system
+
+    ### Start of source code by Antoine Fourmy
+    def get_vrf(self, vrf):
+
+        regular_expressions = {
+                    # we use .*? instead of .* to make the regex "non greedy"
+                    'Export RT': re.compile('.*Export VPN route-target communities(.*?)[No|Import]', re.DOTALL),
+                    'Import RT': re.compile('.*Import VPN route-target communities(.*?)[No|Import]', re.DOTALL),
+                    'Export RM': re.compile('.*Export route-map:(.*?)Route', re.DOTALL),
+                    'Import RM': re.compile('.*Import route-map:(.*?)No', re.DOTALL),
+                    }
+
+        command = 'show vrf detail {}'.format(vrf)
+        output = self._send_command(command)
+
+        vrf_data = {}
+        vrf = output
+
+        sections = vrf.split('Address family ')
+
+        # retrieve the name and the RD
+        name, RD = re.match(r'.*VRF (\S+) \(.*RD (.*);', sections[0], re.DOTALL).groups()
+        # retrieve the list of interfaces of the VRF
+        if_regex = re.match(r'.*Interfaces:(.*)', sections[0], re.DOTALL)
+        interfaces = '' if 'No interfaces' in sections[0] else if_regex.group(1)
+        vrf_data[name] = {'RD': RD, 'interfaces': set(interfaces.split())}
+
+        matches = {}
+        for section in sections[1:]:
+            afi_match = re.match(r'^(\w+\s\w+).*', section, re.DOTALL)
+            if afi_match:
+                afi = afi_match.group(1)
+                vrf_data[name][afi] = {}
+                for regex_name, regex in regular_expressions.items():
+                    match = re.match(regex, section)
+                    result = set(match.group(1).split()) if match else set()
+                    if regex_name in ('Export RT', 'Import RT'):
+                        # the regex catches RT:x:y, we remove the 'RT:' part
+                        result = {r[3:] for r in result}
+                    vrf_data[name][afi][regex_name] = result
+
+        return vrf_data
+
+    def get_bgp_vpnv4_vrf(self, vrf):
+
+        command = 'show ip bgp vpnv4 vrf {} detail'.format(vrf)
+        output = self._send_command(command)
+
+        result = {}
+
+        for entry in output.split('BGP routing table')[1:]:
+            ip = re.match('.*\d+:\d+:(.*?)/\d{1,2},', entry).group(1)
+            RT = re.match('.*Extended Community: (.*?)[Originator|mpls]', entry, re.DOTALL)
+            community = re.match('.*Community: (\d+:\d+)', entry, re.DOTALL)
+            result[ip] = {}
+            if RT:
+                result[ip]['RT'] = {rt[3:] for rt in RT.group(1).split()}
+            if community:
+                result[ip]['community'] = {c for c in community.group(1).split()}
+            for parameter in ('Origin', 'metric', 'localpref'):
+                match = re.match('.*{} (.*?), .*'.format(parameter), entry, re.DOTALL)
+                result[ip][parameter.lower()] = match.group(1) if match else -1
+
+        return result
+
+    ### End of source code by Antoine Fourmy
+
+    ### Start of source code by Tomas Kubina
+    @staticmethod
+    def parse_bfd_uptime(uptime_str):
+        """
+        Extract the uptime string from the given Cisco IOS Device.
+        Return the uptime in seconds as an integer
+        """
+
+        # Initialize to zero
+        (years, weeks, days, hours, minutes, seconds) = (0, 0, 0, 0, 0, 0)
+
+        uptime_str = uptime_str.strip()
+        if ':' in uptime_str:
+            hours = int(uptime_str.split(':')[0])
+            minutes = int(uptime_str.split(':')[1])
+            seconds = int(uptime_str.split(':')[2])
+        else:
+            if re.search("y", uptime_str):
+                years = int(uptime_str.split('y')[0])
+            elif re.search("w", uptime_str):
+                weeks = int(uptime_str.split('w')[0])
+            elif re.search("d", uptime_str):
+                days = int(uptime_str.split('d')[0])
+            elif re.search("h", uptime_str):
+                hours = int(uptime_str.split('h')[0])
+            elif re.search("m", uptime_str):
+                minutes = int(uptime_str.split('m')[0])
+            elif re.search("s", uptime_str):
+                seconds = int(uptime_str.split('s')[0])
+
+        uptime_sec = (years * YEAR_SECONDS) + (weeks * WEEK_SECONDS) + (days * DAY_SECONDS) + \
+                     (hours * 3600) + (minutes * 60) + seconds
+        return uptime_sec
+
+    def get_redundancy_info(self):
+        """ Return show redundancy output """
+
+        show_redu_info = {}
+        show_redu_info['available_system_uptime'] = 'unknown'
+        show_redu_info['configured_redundancy_mode'] = 'unknown'
+        show_redu_info['operating_redundancy_mode'] = 'unknown'
+        show_redu_info['communications'] = 'unknown'
+        show_redu_info['active_re'] = {'slot' : 'unkown'}
+        show_redu_info['backup_re'] = {'slot' : 'unkown'}
+
+        show_redu = self._send_command("show redundancy")
+        for line in show_redu.splitlines():
+            if 'Available system uptime' in line:
+                show_redu_info['available_system_uptime'] = self.parse_uptime(line.split('= ')[1])
+            elif 'Configured Redundancy Mode' in line:
+                show_redu_info['configured_redundancy_mode'] = line.split('= ')[1]
+            elif 'Operating Redundancy Mode' in line:
+                show_redu_info['operating_redundancy_mode'] = line.split('= ')[1]
+            elif 'Communications' in line:
+                show_redu_info['communications'] = line.split('= ')[1]
+            else:
+                pass
+        try:
+            match_current_processor = re.compile(r'^Current\ Processor(.*)^Peer\ ', re.M|re.DOTALL)
+            curret_proccessor_info = match_current_processor.search(show_redu)
+            current_processor = curret_proccessor_info.group(1)
+        except AttributeError:
+            current_processor = ''
+
+        for line in current_processor.splitlines():
+            if 'Active Location' in line:
+                show_redu_info['active_re']['slot'] = int(line.split('= ')[1].split()[1])
+            elif 'Current Software state' in line:
+                show_redu_info['active_re']['current_software_state'] = line.split('= ')[1]
+            elif 'Uptime in current state' in line:
+                show_redu_info['active_re']['uptime_in_current_state'] = self.parse_uptime(line.split('= ')[1])
+            elif 'Image Version' in line:
+                show_redu_info['active_re']['image_version'] = line.split('= ')[1]
+            elif 'BOOT =' in line:
+                show_redu_info['active_re']['boot'] = line.split('= ')[1]
+            elif 'CONFIG_FILE' in line:
+                show_redu_info['active_re']['config_file'] = line.split('= ')[1]
+            elif 'BOOTLDR =' in line:
+                show_redu_info['active_re']['bootldr'] = line.split('= ')[1]
+            elif 'Configuration register' in line:
+                show_redu_info['active_re']['configuration_register'] = line.split('= ')[1]
+            else:
+                continue
+        try:
+            match_peer_processor = re.compile(r'^Peer\ Processor(.*)', re.M|re.DOTALL)
+            peer_proccessor_info = match_peer_processor.search(show_redu)
+            peer_processor = peer_proccessor_info.group(1)
+        except AttributeError:
+            peer_processor = ''
+
+        for line in peer_processor.splitlines():
+            if 'Standby Location' in line:
+                show_redu_info['backup_re']['slot'] = int(line.split('= ')[1].split()[1])
+            elif 'Current Software state' in line:
+                show_redu_info['backup_re']['current_software_state'] = line.split('= ')[1]
+            elif 'Uptime in current state' in line:
+                show_redu_info['backup_re']['uptime_in_current_state'] = self.parse_uptime(line.split('= ')[1])
+            elif 'Image Version' in line:
+                show_redu_info['backup_re']['image_version'] = line.split('= ')[1]
+            elif 'BOOT =' in line:
+                show_redu_info['backup_re']['boot'] = line.split('= ')[1]
+            elif 'CONFIG_FILE' in line:
+                show_redu_info['backup_re']['config_file'] = line.split('= ')[1]
+            elif 'BOOTLDR =' in line:
+                show_redu_info['backup_re']['bootldr'] = line.split('= ')[1]
+            elif 'Configuration register' in line:
+                show_redu_info['backup_re']['configuration_register'] = line.split('= ')[1]
+            else:
+                pass
+        return show_redu_info
+
+    def get_card_type_info(self):
+        """ Return list of installed cards with corresponding slots """
+
+        card_type_info = {}
+
+        facts = self.get_facts()
+        model = facts['model']
+
+        if 'ASR10' in model:
+            show_cards = self._send_command("show platform")
+            try:
+                match_card_list = re.compile(r'^Slot(.*)Slot', re.M|re.DOTALL)
+                match_card_info = match_card_list.search(show_cards)
+                card_list = match_card_info.group(1)
+            except AttributeError:
+                card_list = ''
+
+            for line in card_list.splitlines():
+                if 'Type' in line:
+                    continue
+                elif '--' in line:
+                    continue
+                else:
+                    card_line = line.strip()
+                    card_line = card_line.replace(',', ' ')
+                    while '  ' in card_line:
+                        card_line = card_line.replace('  ', ' ')
+                    card_info = card_line.split()
+                    if card_info != []:
+                        card_type_info[str(card_info[0])] = {'type' : card_info[1], 'state' : card_info[2]}
+                    else:
+                        pass
+
+        elif 'CISCO7609-S' in model:
+            show_cards = self._send_command("show module")
+
+            try:
+                match_slot_list = re.compile(r'Ports(.*)MAC', re.M|re.DOTALL)
+                match_slot_info = match_slot_list.search(show_cards)
+                slot_list = match_slot_info.group(1)
+            except AttributeError:
+                slot_list = ''
+
+            for line in slot_list.splitlines():
+                if 'Mod' in line:
+                    continue
+                elif '--' in line:
+                    continue
+                else:
+                    try:
+                        match_slot_id = re.search(r'(^\ +[0-9]+)', line)
+                        slot_id = match_slot_id.group(1)
+
+                        match_card_type = re.search(r'\ +([\w\-]+)\ +[\w]+$', line)
+                        card_type = match_card_type.group(1)
+
+                        card_type_info[str(slot_id)] = {'type' : card_type, 'state' : 'unknown'}
+                    except AttributeError:
+                        pass
+
+            try:
+                match_slot_list = re.compile(r'MAC(.*)Sub-Module', re.M|re.DOTALL)
+                match_slot_info = match_slot_list.search(show_cards)
+                slot_list = match_slot_info.group(1)
+            except AttributeError:
+                slot_list = ''
+
+            for line in slot_list.splitlines():
+                if 'Mod' in line:
+                    continue
+                elif '--' in line:
+                    continue
+                else:
+                    try:
+                        match_slot_id = re.search(r'(^\ +[0-9]+)', line)
+                        slot_id = match_slot_id.group(1)
+
+                        match_slot_state = re.search(r'\ ([\w]+)$', line)
+                        slot_state = match_slot_state.group(1)
+
+                        card_type_info[str(slot_id)]['state'] = slot_state
+                    except AttributeError:
+                        pass
+
+            try:
+                match_card_list = re.compile(r'Sub-Module(.*)Online', re.M|re.DOTALL)
+                match_card_info = match_card_list.search(show_cards)
+                card_list = match_card_info.group(1)
+            except AttributeError:
+                card_list = ''
+
+            for line in card_list.splitlines():
+                if 'Model' in line:
+                    continue
+                elif '--' in line:
+                    continue
+                else:
+                    try:
+                        match_card_slot = re.search(r'([0-9]+\/[0-9])', line)
+                        card_slot = match_card_slot.group(1)
+                        match_card_type = re.search(r'(SPA[\w\-]+)\ ', line)
+                        card_type = match_card_type.group(1)
+                        match_card_state = re.search(r'\ ([\w]+)$', line)
+                        card_state = match_card_state.group(1)
+
+                        card_type_info[str(card_slot)] = {'type' : card_type, 'state' : card_state}
+                    except AttributeError:
+                        pass
+        else:
+            pass
+
+        return card_type_info
+
+    def get_asr1k_slot_memory_info(self):
+        """ Returns memory status for all slots of ASR1K platform"""
+
+        asr1k_memory_detail = {}
+
+        show_platform_sw_status = self._send_command("show platform software status control-processor brief")
+        try:
+            match_mem_table_exp = re.compile(r'Memory\s\(kB\)(.*)CPU\sUtilization', re.M|re.DOTALL)
+            match_mem_table = match_mem_table_exp.search(show_platform_sw_status)
+            mem_table = match_mem_table.group(1)
+        except AttributeError:
+            mem_table = ''
+
+        mem_table = mem_table.strip()
+        for line in mem_table.splitlines():
+            if 'Slot' in line:
+                continue
+            else:
+                try:
+                    match_slot_info = re.search(r'^\s+(\w+)\s+(\w+)\s+([0-9]+)\s+([0-9]+)\s+\([0-9]+\%\)\s+([0-9]+)\s+\([0-9]+\%\)\s+([0-9]+)\s+\([0-9]+\%\)',line)
+                    asr1k_memory_detail[match_slot_info.group(1)] = {'status': match_slot_info.group(2),
+                                                                     'total': match_slot_info.group(3), 
+                                                                     'used': match_slot_info.group(4),
+                                                                     'free': match_slot_info.group(5),
+                                                                     'commited': match_slot_info.group(6)}
+                except AttributeError:
+                    continue
+
+        return asr1k_memory_detail
+
+    def get_isis_neighbors_detail(self):
+        """ Returns list of ISIS neighbors with details """
+
+        isis_neighbors = {}
+
+        show_isis_nei_det = self._send_command("show isis neighbors detail")
+        try:
+            show_isis_nei_det = show_isis_nei_det.split('Circuit Id\n')[1]
+        except IndexError:
+            return isis_neighbors 
+
+        isis_neighbor_info = ''
+
+        for line in show_isis_nei_det.splitlines():
+            if line[0:1] == '':
+                continue
+            elif line[0:1] == ' ':
+                if 'Area Address' in line:
+                    area_id = line.split(':')[1]
+                    isis_neighbors[str(isis_neighbor_info[0])][isis_neighbor_info[2]]['area'] = area_id.strip()
+                if 'SNPA' in line:
+                    snpa = line.split(':')[1]
+                    isis_neighbors[str(isis_neighbor_info[0])][isis_neighbor_info[2]]['snpa'] = snpa.strip()
+                if 'State Changed' in line:
+                    state_changed = line.split('Changed:')[1]
+                    isis_neighbors[str(isis_neighbor_info[0])][isis_neighbor_info[2]]['state_changed'] = self.parse_bfd_uptime(str(state_changed.strip()))
+                if 'Format' in line:
+                    _format = line.split(':')[1]
+                    isis_neighbors[str(isis_neighbor_info[0])][isis_neighbor_info[2]]['format'] = _format.strip()
+                if 'Remote TID' in line:
+                    r_tid = line.split(':')[1]
+                    isis_neighbors[str(isis_neighbor_info[0])][isis_neighbor_info[2]]['remote_tid'] = r_tid.strip()
+                if 'Local TID' in line:
+                    l_tid = line.split(':')[1]
+                    isis_neighbors[str(isis_neighbor_info[0])][isis_neighbor_info[2]]['local_tid'] = l_tid.strip()
+                if 'Remote BFD Support' in line:
+                    r_bfd = line.split('Support:')[1]
+                    isis_neighbors[str(isis_neighbor_info[0])][isis_neighbor_info[2]]['remote_bfd_support'] = r_bfd.strip()
+                if 'BFD enabled' in line:
+                    bfd = line.split('enabled:')[1]
+                    isis_neighbors[str(isis_neighbor_info[0])][isis_neighbor_info[2]]['bfd_enabled'] = bfd.strip()
+            else:
+                # we have ISIS neighbor line
+                isis_neighbor_info = line.split()
+                if str(isis_neighbor_info[0]) not in isis_neighbors.keys():
+                    isis_neighbors[str(isis_neighbor_info[0])] = {}
+                isis_neighbors[str(isis_neighbor_info[0])][isis_neighbor_info[2]] = {'level': isis_neighbor_info[1],
+                                                                                     'ip_address': isis_neighbor_info[3],
+                                                                                     'state': isis_neighbor_info[4],
+                                                                                     'holdtime': isis_neighbor_info[5],
+                                                                                     'circuit_id': isis_neighbor_info[6]}
+
+        return isis_neighbors
+
+    def get_isis_topology(self):
+        """ Returns ISIS topology info """
+
+        isis_topo = {}
+        isis_node_name = ''
+        isis_node_metric = ''
+
+        show_isis_topo = self._send_command("show isis topology")
+        try:
+            show_isis_topo = show_isis_topo.split('SNPA')[1]
+        except IndexError:
+            return isis_topo
+
+        for line in show_isis_topo.splitlines():
+            if line[0:1] == '':
+                continue
+            elif line[0:1] == ' ':
+                isis_path_info = line.split()
+                try:
+                    match_snpa = re.search(r'\ ([\*\w]+\ [\w\-]+|[\w\.\*]+)$', line)
+                    isis_snpa = match_snpa.group(1)
+                except AttributeError:
+                    isis_snpa = ''
+
+                isis_topo[isis_node_name].append({'metric': isis_node_metric,
+                                                  'next_hop': isis_path_info[0],
+                                                  'interface': isis_path_info[1],
+                                                  'snpa': isis_snpa})
+            else:
+                # we have ISIS router
+                isis_path_info = line.split()
+                line = line.strip()
+                try:
+                    match_snpa = re.search(r'\ ([\*\w]+\ [\w\-]+|[\w\.\*]+)$', line)
+                    isis_snpa = match_snpa.group(1)
+                except AttributeError:
+                    isis_snpa = ''
+
+                isis_node_name = isis_path_info[0]
+                isis_node_metric = isis_path_info[1]
+
+                if isis_node_metric == '--' or isis_node_metric == '**':
+                    continue
+                
+                isis_topo[str(isis_node_name)] = [{'metric': isis_node_metric,
+                                                   'next_hop': isis_path_info[2],
+                                                   'interface': isis_path_info[3],
+                                                   'snpa': isis_snpa}]
+        return isis_topo
+
+    def get_bfd_neighbors_detail(self):
+        """ Returns list of BFD neighbors with details """
+
+        bfd_neighbors = {}
+
+        show_bfd_nei_det = self._send_command("show bfd neighbors details")
+        show_bfd_nei_det = show_bfd_nei_det.split('NeighAddr')
+
+        for neighbor in show_bfd_nei_det:
+            neighbor_all_info = neighbor.splitlines()
+            try:
+                if 'State' not in neighbor_all_info[0]:
+                    continue
+            except IndexError:
+                continue
+
+            neighbor_info = neighbor_all_info[1].split()
+            bfd_neighbors[str(neighbor_info[0])] = {'LD': neighbor_info[1].split('/')[0].strip(),
+                                                    'RD': neighbor_info[1].split('/')[1].strip(),
+                                                    'state': neighbor_info[3],
+                                                    'interface': neighbor_info[4]}
+            bfd_neighbors[str(neighbor_info[0])]['echo_mode'] = 'unknown'
+            bfd_neighbors[str(neighbor_info[0])]['echo_interval'] = 0 
+
+            for line in neighbor_all_info:
+                if 'Session Host' in line:
+                    bfd_neighbors[str(neighbor_info[0])]['session_host'] = line.split(':')[1].strip()
+                elif 'Registered protocols' in line:
+                    bfd_neighbors[str(neighbor_info[0])]['registered_protocols'] = line.split(':')[1].strip().split()
+                elif 'Uptime' in line:
+                    bfd_neighbors[str(neighbor_info[0])]['uptime'] = self.parse_bfd_uptime(str(line.split(':')[1].strip()))
+                elif 'Session state is UP' in line:
+                    if 'not using echo function' in line:
+                        bfd_neighbors[str(neighbor_info[0])]['echo_mode'] = 'inactive'
+                        bfd_neighbors[str(neighbor_info[0])]['echo_interval'] = 0 
+                    elif 'using echo function with' in line:
+                        bfd_neighbors[str(neighbor_info[0])]['echo_mode'] = 'active'
+                        echo_interval = re.search(r'([0-9]+)\s+ms', line)
+                        bfd_neighbors[str(neighbor_info[0])]['echo_interval'] = echo_interval.group(1)
+                    else:
+                        pass
+                else:
+                    continue
+
+        return bfd_neighbors
+
+    def get_ldp_igp_sync(self):
+        """ Returns sync status between LDP and IGP """
+
+        ldp_igp_sync_status = {}
+
+        show_mpls_ldp_igp_sync = self._send_command("show mpls ldp igp sync")
+
+        for line in show_mpls_ldp_igp_sync.splitlines():
+            if re.search(r'\:$', line):
+                interface = str(line.strip())
+                ldp_igp_sync_status[interface] = {}
+            else:
+                if 'Synchronization not enabled' in line:
+                    ldp_igp_sync_status[interface] = {'ldp_igp_sync_enabled':'no'}
+                    ldp_igp_sync_status[interface]['sync_achieved'] = 'no'
+                    continue
+                elif 'Sync status' in line:
+                    ldp_igp_sync_status[interface] = {'ldp_igp_sync_enabled':'yes'}
+                    if 'sync achieved' in line:
+                        ldp_igp_sync_status[interface]['sync_achieved'] = 'yes'
+                    else:
+                        ldp_igp_sync_status[interface]['sync_achieved'] = 'no'
+                    
+        return ldp_igp_sync_status
+
+    def get_ldp_neighbors(self):
+        """ Return LDP neighbor info list """
+    
+        ldp_neighbors = {}
+
+        show_mpls_ldp_neigh = self._send_command("show mpls ldp neighbor")
+        show_mpls_ldp_neigh = show_mpls_ldp_neigh.split('Peer LDP Ident')
+        for peer in show_mpls_ldp_neigh:
+            if 'LDP' not in peer:
+                continue
+            try:
+                peer_ip = re.search(r':\ (.+);', peer)
+                ldp_neighbors[str(peer_ip.group(1))] = {}
+                ldp_neighbors[str(peer_ip.group(1))]['discovery_sources'] = []
+            except AttributeError:
+                continue
+
+            for line in peer.splitlines():
+                if 'State' in line:
+                    try:
+                        peer_state = re.search(r'State:\ (\w+);', peer)
+                        ldp_neighbors[str(peer_ip.group(1))]['state'] = peer_state.group(1)
+                    except AttributeError:
+                        continue
+                if 'Up time' in line:
+                    ldp_neighbors[str(peer_ip.group(1))]['uptime'] = self.parse_bfd_uptime(str(line.split(':')[1].strip()))
+            
+            try:
+                match_peer_prefixes = re.compile(r'Addresses bound to peer LDP Ident:(.*)', re.M|re.DOTALL)
+                peer_prefixes_list = match_peer_prefixes.search(peer)
+                peer_prefixes = peer_prefixes_list.group(1)
+                ldp_neighbors[str(peer_ip.group(1))]['addresses'] = peer_prefixes.split()
+            except AttributeError:
+                continue
+
+            try:
+                match_discovery_sources = re.compile(r'LDP discovery sources:(.*)Addresses bound to peer LDP Ident:', re.M|re.DOTALL)
+                discovery_sources_list = match_discovery_sources.search(peer)
+                discovery_sources = discovery_sources_list.group(1)
+                for line in discovery_sources.splitlines():
+                    if line == '':
+                        pass
+                    elif line == '        ':
+                        pass
+                    else:
+                        ldp_neighbors[str(peer_ip.group(1))]['discovery_sources'].append(line.strip().split()[0].strip(','))
+            except AttributeError:
+                continue
+
+        return ldp_neighbors
+
+    def get_mpls_l2transport_summary(self):
+        """ Return summary of l2 transport connections"""
+
+        l2transport_summary = {}
+
+        command = "show mpls l2transport summary" 
+        show_l2_sum = self._send_command(command)
+        show_l2_sum = show_l2_sum.strip().split('Destination')
+
+        for peer in show_l2_sum:
+            for line in peer.splitlines():
+                if 'address' in line:
+                    try:
+                        match_dst_address = re.search(r'address:\s+(.*)\,', line)
+                        dst_address = str(match_dst_address.group(1))
+                        l2transport_summary[dst_address] = {}
+                    except AttributeError:
+                        continue
+                if 'unknown' in line:
+                    try:
+                        match_unknow = re.search(r'([0-9]+)\s+unknown', line)
+                        l2transport_summary[dst_address]['unknown'] = int(match_unknow.group(1)) 
+
+                        match_up = re.search(r'([0-9]+)\s+up', line)
+                        l2transport_summary[dst_address]['up'] = int(match_up.group(1)) 
+
+                        match_down = re.search(r'([0-9]+)\s+down', line)
+                        l2transport_summary[dst_address]['down'] = int(match_down.group(1)) 
+
+                        match_adm_down = re.search(r'([0-9]+)\s+admin\ down', line)
+                        l2transport_summary[dst_address]['admin_down'] = int(match_adm_down.group(1)) 
+
+                        match_recovering = re.search(r'([0-9]+)\s+recovering', line)
+                        l2transport_summary[dst_address]['recovering'] = int(match_recovering.group(1)) 
+
+                        match_standby = re.search(r'([0-9]+)\s+standby', line)
+                        l2transport_summary[dst_address]['standby'] = int(match_standby.group(1))
+
+                        match_hotstandby = re.search(r'([0-9]+)\s+hotstandby', line)
+                        l2transport_summary[dst_address]['hotstandby'] = int(match_hotstandby.group(1)) 
+                    except AttributeError:
+                        continue
+                if 'active' in line:
+                    try:
+                        match_interface = re.search(r'\s([\w\.\/]+)$', line)
+                        interface = str(match_interface.group(1))
+                        match_active = re.search(r'\s+([0-9]+)\s+', line)
+                        l2transport_summary[dst_address][interface] = {'active': int(match_active.group(1))}
+                    except AttributeError:
+                        continue
+        return l2transport_summary
+
+    def get_mpls_te_tunnels_brief(self):
+        """ Returns summart of TE tunnels """
+
+        te_tunnels_summary = {}
+
+        command = "show mpls traffic-eng tunnels brief"
+        show_te_tunnels_brief = self._send_command(command)
+
+        try:
+            show_te_tunnels_brief = show_te_tunnels_brief.strip().split('STATE/PROT')[1].strip()
+        except IndexError:
+            return te_tunnels_summary
+
+        for line in show_te_tunnels_brief.splitlines():
+            try:
+                te_tunnel = line.strip()
+                split_tunnel_data = re.search(r'([\w\-\_\.\/\(\)\W\s]+)\s+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\s+([\w\/\-]+)\s+([\w\/\-]+)\s+([\w\/\-]+)', te_tunnel)
+                tunnel_name = str(split_tunnel_data.group(1).strip())
+                te_tunnels_summary[tunnel_name] = {}
+                te_tunnels_summary[tunnel_name]['destination'] = str(split_tunnel_data.group(2))
+                te_tunnels_summary[tunnel_name]['up_if'] = str(split_tunnel_data.group(3))
+                te_tunnels_summary[tunnel_name]['down_if'] = str(split_tunnel_data.group(4))
+                te_tunnels_summary[tunnel_name]['state_prot'] = str(split_tunnel_data.group(5))
+            except AttributeError:
+                continue
+
+        return te_tunnels_summary
+
+    @staticmethod
+    def _parse_ip_route_summary_output(output):
+        """ Routing table parsing function """
+
+        ip_route_sum = {}
+
+        for line in output.splitlines():
+            match_source_info = re.search(r'([\w\s]+)\s+([0-9]+)\s+([0-9]+)\s+([0-9]+)\s+([0-9]+)\s+([0-9]+)', line)
+            if match_source_info:
+                ip_route_sum[match_source_info.group(1).strip()] = {'networks': match_source_info.group(2),
+                                                                    'subnets': match_source_info.group(3),
+                                                                    'replicates': match_source_info.group(4),
+                                                                    'overhead': match_source_info.group(5),
+                                                                    'memory_bytes': match_source_info.group(6)
+                                                                    }
+        return ip_route_sum
+
+    def get_ip_route_summary(self):
+        """ Returns summary of global routing table """
+
+        command = "show ip route summary"
+        show_ip_route_summary = self._send_command(command)
+
+        show_ip_route_summary = show_ip_route_summary.strip()
+
+        return self._parse_ip_route_summary_output(show_ip_route_summary)
+
+    def get_ip_route_summary_vrf(self, vrf_name):
+        """ Returns summary of vrf routing table """
+
+        command = "show ip route vrf " + vrf_name + " summary"
+        show_ip_route_vrf_summary = self._send_command(command)
+
+        show_ip_route_vrf_summary = show_ip_route_vrf_summary.strip()
+
+        return self. _parse_ip_route_summary_output(show_ip_route_vrf_summary)
+
+    @staticmethod
+    def _parse_ip_cef_output(output):
+        """ IP CEF output parsing function"""
+
+        ip_cef = {}
+
+        output = output.split('Interface')
+        if len(output) > 1:
+            output = output[1].strip()
+            for line in output.splitlines():
+                prefix_info = line.split()
+                ip_cef[prefix_info[0]] = {'next_hop': prefix_info[1]}
+                if len(prefix_info) == 3:
+                    ip_cef[prefix_info[0]]['interface'] = prefix_info[2]
+
+        return ip_cef
+
+    def get_ip_cef(self):
+        """ Return IP CEF in global context """
+
+        command = "show ip cef"
+        show_ip_cef = self._send_command(command)
+
+        show_ip_cef = show_ip_cef.strip()
+
+        return self. _parse_ip_cef_output(show_ip_cef)
+
+    def get_ip_cef_vrf(self, vrf_name):
+        """ Return IP CEF in vrf context """
+
+        command = "show ip cef vrf " + vrf_name
+        show_ip_cef_vrf = self._send_command(command)
+
+        show_ip_cef_vrf = show_ip_cef_vrf.strip()
+
+        return self._parse_ip_cef_output(show_ip_cef_vrf)
+
+    def get_interfaces_rates(self):
+        """ Returns input/output rate for interfaces """
+
+        interface_rates = {}
+
+        command = "show interfaces"
+        show_interfaces = self._send_command(command)
+        show_interfaces = show_interfaces.strip()
+
+        interfaces_data = re.split(r'.* line protocol is .*', show_interfaces, flags=re.M)
+        interfaces_name = re.findall(r'.* line protocol is .*', show_interfaces, flags=re.M)
+        del interfaces_data[0]
+
+        for interface, int_data in zip(interfaces_name, interfaces_data):
+            try:
+                interface_name = interface.split()[0]
+                interface_rates[interface_name] = {}
+            except IndexError:
+                continue
+
+            try:
+                match_input_rate = re.compile(r'input\s+rate\s+([0-9]+)\s+[\w\/]+\,\s+([0-9]+)', re.M|re.DOTALL)
+                input_rate_data = match_input_rate.search(int_data)
+                match_output_rate = re.compile(r'output\s+rate\s+([0-9]+)\s+[\w\/]+\,\s+([0-9]+)', re.M|re.DOTALL)
+                output_rate_data = match_output_rate.search(int_data)
+                interface_rates[interface_name] = {'input_rate': {'bps': int(input_rate_data.group(1)) , 'pps': int(input_rate_data.group(2))},
+                                                'output_rate': {'bps': int(output_rate_data.group(1)) , 'pps': int(output_rate_data.group(2))}
+                                                }
+            except AttributeError:
+                continue
+        return interface_rates
+
+    def get_xconnect_all(self):
+        """ Returns list of all xconnects """
+        xconnect = []
+
+        command = "show xconnect all"
+        show_xconnect_all = self._send_command(command)
+        show_xconnect_all = show_xconnect_all.strip()
+
+        for line in show_xconnect_all.splitlines():
+            try:
+                match_xconnect_info = re.search(r'([\w\-]+)\s(\w+)\s([\W\w]+)\s+(UP|DN|AD|IA|SB|HS|RV|NH|--)\s([\w\W]+)\s+(UP|DN|AD|IA|SB|HS|RV|NH|--)', line)
+                xconnect.append({'xc_state': [match_xconnect_info.group(1).strip(), match_xconnect_info.group(2).strip()],
+                                'segment_1': match_xconnect_info.group(3).strip(),
+                                'segment_1_state': match_xconnect_info.group(4).strip(),
+                                'segment_2': match_xconnect_info.group(5).strip(),
+                                'segment_2_state': match_xconnect_info.group(6).strip()})
+            except AttributeError:
+                continue
+        
+        return xconnect
+
+    def get_bgp_all_summary(self):
+        """ Returns bgp neighbors list with summary details """
+        bgp_neighbors = {}
+
+        command = "show bgp all summary"
+        show_bgp_all_summary = self._send_command(command)
+        show_bgp_all_summary = show_bgp_all_summary.strip()
+
+        afi_data = re.split(r'For address family:',show_bgp_all_summary, flags=re.M)
+        afi_name = re.findall(r'For address family\:\s+([\w\s]+)$', show_bgp_all_summary, flags=re.M)
+        is_v6 = 0
+
+        del afi_data[0]
+
+        for name, data in zip(afi_name, afi_data):
+            bgp_neighbors[name] = {}
+            for line in data.splitlines():
+                try:
+                    match_neighbor_info = re.search(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+4\s+(\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+([\w\:]+)\s+([\d\w\W]+)', line)
+                    if match_neighbor_info:
+                        neighbor_ip = str(match_neighbor_info.group(1))
+
+                        if re.search(r'(\d+)', match_neighbor_info.group(4)):
+                            state = 'Established'
+                            pfx_received = int(match_neighbor_info.group(4))
+                        if re.search(r'([a-zA-Z]+)', match_neighbor_info.group(4)):
+                            state = str(match_neighbor_info.group(4))
+                            pfx_received = 0
+
+                        bgp_neighbors[str(name)][neighbor_ip] = {'as': str(match_neighbor_info.group(2)),
+                                                                'up/down': self.parse_bfd_uptime(str(match_neighbor_info.group(3))),
+                                                                'state': state,
+                                                                'pfx_rcv': pfx_received}
+                    match_ipv6_neighbor = re.compile(r'^\*?({})'.format(IPV6_ADDR_REGEX))
+                    match_neighbor_info = match_ipv6_neighbor.search(line)
+                    if match_neighbor_info:
+                        is_v6 = 1
+                        neighbor_ipv6 = str(match_neighbor_info.group(1))
+                    if is_v6 == 1:
+                        is_v6 = 0
+                        match_neighbor_info = re.search(r'\s+4\s+(\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+([\w\:]+)\s+([\d\w\W]+)', line)
+                        if match_neighbor_info:
+                            
+                            if re.search(r'(\d+)', match_neighbor_info.group(3)):
+                                state = 'Established'
+                                pfx_received = int(match_neighbor_info.group(3))
+                            if re.search(r'([a-zA-Z]+)', match_neighbor_info.group(3)):
+                                state = str(match_neighbor_info.group(3))
+                                pfx_received = 0
+
+
+                            bgp_neighbors[str(name)][neighbor_ipv6] = {'as': str(match_neighbor_info.group(1)),
+                                                                       'up/down': self.parse_bfd_uptime(str(match_neighbor_info.group(2))),
+                                                                       'state': state,
+                                                                       'pfx_rcv': pfx_received}
+
+                except AttributeError:
+                    continue
+
+        return bgp_neighbors
+
+    @staticmethod
+    def _parse_pim_neighbors_output(output):
+        """ PIM neighbor parsing function """
+
+        pim_neighbors = {}
+
+        for line in output.splitlines():
+            try:
+                match_neigh = re.search(r'^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)', line)
+                neighbor_ip = match_neigh.group(1)
+                neighbor_info = line.split()
+                uptime = neighbor_info[2].split('/')[0]
+                expiration = neighbor_info[2].split('/')[1]
+                match_neigh_mode = re.search(r'\/\s+(.*)$', line)
+                # neigh_mode = match_neigh_mode.group(1)
+                pim_neighbors[str(neighbor_ip)] = {'interface': neighbor_info[1],
+                                                   'uptime': IOSDriver.parse_bfd_uptime(str(uptime)),
+                                                   'expiration': IOSDriver.parse_bfd_uptime(str(expiration)),
+                                                   'version': neighbor_info[3].split('v')[1],
+                                                   'dr_priority': neighbor_info[4],
+                                                   'mode': 'unknown'}
+            except AttributeError:
+                continue
+
+        return pim_neighbors
+
+    def get_pim_neighbors(self):
+        """ Return PIM neighbors in global context """
+
+        command = "show ip pim neighbor"
+        show_pim_neigh = self._send_command(command)
+
+        show_pim_neigh = show_pim_neigh.strip()
+
+        return self._parse_pim_neighbors_output(show_pim_neigh)
+
+    def get_pim_neighbors_vrf(self, vrf_name):
+        """ Return PIM neighbors in vrf context """
+
+        command = "show ip pim vrf " + vrf_name + " neighbor" 
+        show_pim_neigh = self._send_command(command)
+
+        show_pim_neigh = show_pim_neigh.strip()
+
+        return self._parse_pim_neighbors_output(show_pim_neigh)
+
+    @staticmethod
+    def _parse_mroute_output(output):
+        """ mroute parsing function """
+
+        mroutes = {}
+
+        try:
+            match_mcast_entry = re.compile(r'\n\(', re.M|re.DOTALL)
+            mcast_entries = match_mcast_entry.split(output)
+        except AttributeError:
+            pass
+
+        for entry in mcast_entries:
+            try:
+                match_mroute_entry = re.compile(r'(.*)\)\,', re.M|re.DOTALL)
+                mcast_pair = match_mroute_entry.search(entry)
+                mcast_pair = mcast_pair.group(1).split(',')
+                mroute_address = mcast_pair[1].strip()
+                if not mroutes.has_key(mroute_address):
+                    mroutes[mroute_address] = {}
+                source = mcast_pair[0].strip()
+                mroutes[mroute_address][source] = {}
+
+                match_mroute_timers = re.compile(r'\)\,\s+([\w\/\:]+)\,\s+', re.M|re.DOTALL)
+                mroute_timers = match_mroute_timers.search(entry)
+                if mroute_timers:
+                    timers = mroute_timers.group(1).strip().split('/')
+                    mroutes[mroute_address][source]['uptime'] = IOSDriver.parse_bfd_uptime(str(timers[0]))
+                    if ':' in timers[1]:
+                        mroutes[mroute_address][source]['expires'] = IOSDriver.parse_bfd_uptime(str(timers[1]))
+                    else:
+                        mroutes[mroute_address][source]['expires'] = timers[1]
+
+                match_mroute_rp = re.compile(r'RP\s+([\w\.]+)\,', re.M|re.DOTALL)
+                mroute_rp = match_mroute_rp.search(entry)
+                if mroute_rp:
+                    rp = mroute_rp.group(1).strip()
+                    mroutes[mroute_address][source]['rp'] = rp
+
+                match_mroute_flags = re.compile(r'flags\:\s+(\w+)$', re.M|re.DOTALL)
+                mroute_flags = match_mroute_flags.search(entry)
+                if mroute_flags:
+                    flags = mroute_flags.group(1).strip()
+                    mroutes[mroute_address][source]['flags'] = flags
+
+                match_in_int = re.compile(r'Incoming interface\:\s+([\w\/\.\W]+)Outgoing\ interface\ list', re.M|re.DOTALL)
+                in_int = match_in_int.search(entry)
+                if in_int:
+                    in_int_info = {}
+
+                    in_int = in_int.group(1).strip()
+
+                    in_int_det = re.search(r'^([\w\/\.]+)\,\s+RPF\ nbr\s+([0-9\.]+)[\,\s]*', in_int)
+                    if in_int_det:
+                        in_int_info['name'] = in_int_det.group(1)
+                        in_int_info['rpf'] = in_int_det.group(2)
+
+                    in_int_mdt = re.search(r'MDT\:([\w\W]+)', in_int)
+                    if in_int_mdt:
+                        mdt_add = in_int_mdt.group(1).split('/')[0].strip('[')
+                        mdt_add = mdt_add.strip(']').split(',')
+
+                        mdt_timer = in_int_mdt.group(1).split('/')[1]
+
+                        in_int_info['mdt'] = {'source': mdt_add[0], 'mcast_group': mdt_add[1], 'timer': IOSDriver.parse_bfd_uptime(str(mdt_timer))}
+
+                    mroutes[mroute_address][source]['incoming_interface'] = in_int_info
+
+                match_out_int = re.compile(r'Outgoing interface list\:\s+(.*)$', re.M|re.DOTALL)
+                out_int = match_out_int.search(entry)
+                if out_int:
+                    out_int_info = []
+
+                    out_ints_temp = []
+                    out_ints = out_int.group(1).strip().split('\n')
+                    for interface in out_ints:
+                        out_ints_temp.append(interface.strip())
+
+                    out_ints = out_ints_temp
+
+                    for line in out_ints:
+                        out_int = {}
+                        out_int_det = re.search(r'^([\w\/\.]+)\,\s+([\w\/]+)\,\s+([\w\/\:]+)', line)
+                        if out_int_det:
+                            out_int['name'] = out_int_det.group(1)
+                            out_int['state'] = out_int_det.group(2)
+                            out_int['uptime'] = IOSDriver.parse_bfd_uptime(str(out_int_det.group(3).split('/')[0]))
+                            out_int['expires'] = IOSDriver.parse_bfd_uptime(str(out_int_det.group(3).split('/')[1]))
+
+                        out_int_info.append(out_int)
+                    mroutes[mroute_address][source]['outgoing_interfaces'] = out_int_info
+
+            except AttributeError:
+                continue
+
+        return mroutes
+
+    def get_ip_mroute(self):
+        
+        command = "show ip mroute"
+        show_ip_mroute = self._send_command(command)
+
+        show_ip_mroute = show_ip_mroute.strip()
+
+        return self._parse_mroute_output(show_ip_mroute)
+
+    def get_ip_mroute_vrf(self, vrf_name):
+        
+        command = "show ip mroute vrf " + vrf_name
+        show_ip_mroute_vrf = self._send_command(command)
+
+        show_ip_mroute_vrf = show_ip_mroute_vrf.strip()
+
+        return self._parse_mroute_output(show_ip_mroute_vrf)
+
+    @staticmethod
+    def _parse_mroute_active_output(output):
+        
+        mroute_active = {}
+
+        try:
+            match_mcast_entry = re.compile(r'Group\:\s+', re.M|re.DOTALL)
+            mcast_entries = match_mcast_entry.split(output)
+        except AttributeError:
+            pass
+
+        for entry in mcast_entries:
+            try:
+                match_group = re.search(r'([0-9\.]+)\,', entry)
+                if match_group:
+                    group = match_group.group(1).strip()
+
+                    mroute_active[group] = {}
+
+                    for line in entry.splitlines():
+                        if 'Source:' in line:
+                            source = line.split()[1].strip()
+                        if 'RP-tree' in line:
+                            source = '*'
+                        if 'Rate' in line:
+                            rates = line.split('Rate: ')[1].split(',')
+                            rates_info = {}
+
+                            sec_rates = re.search(r'([0-9]+)\s+\w+\/([0-9]+).*', rates[0])
+                            sec30_rates = re.search(r'([0-9]+)\s+kbps', rates[1])
+                            life_avg_rates = re.search(r'([0-9]+)\s+kbps', rates[2])
+
+                            rates_info['1_sec'] = {'pps': sec_rates.group(1), 'kbps': sec_rates.group(2)}
+                            rates_info['30_sec'] = {'kbps': sec30_rates.group(1)}
+                            rates_info['life_avg'] = {'kbps': life_avg_rates.group(1)}
+
+                            mroute_active[group][source] = rates_info
+
+            except AttributeError:
+                continue
+
+        return mroute_active
+
+    def get_ip_mroute_active(self):
+        
+        command = "show ip mroute active"
+        show_ip_mroute_active = self._send_command(command)
+
+        show_ip_mroute_active = show_ip_mroute_active.strip()
+
+        return self._parse_mroute_active_output(show_ip_mroute_active)
+
+    def get_ip_mroute_active_vrf(self, vrf_name):
+        
+        command = "show ip mroute vrf " + vrf_name + " active"
+        show_ip_mroute_vrf_active = self._send_command(command)
+
+        show_ip_mroute_vrf_active = show_ip_mroute_vrf_active.strip()
+
+        return self._parse_mroute_active_output(show_ip_mroute_vrf_active)
+
+    @staticmethod
+    def _parse_mfib_output(output):
+        
+        mfib = {}
+
+        try:
+            match_mcast_entry = re.compile(r'\(', re.M|re.DOTALL)
+            mcast_entries = match_mcast_entry.split(output)
+        except AttributeError:
+            pass
+
+        for entry in mcast_entries:
+            try:
+                match_mroute_entry = re.compile(r'(.*)\)\s+', re.M|re.DOTALL)
+                mcast_pair = match_mroute_entry.search(entry)
+                mcast_pair = mcast_pair.group(1).split(',')
+                mroute_address = mcast_pair[1].strip()
+                if not mfib.has_key(mroute_address):
+                    mfib[mroute_address] = {}
+
+                source = mcast_pair[0].strip()
+                mfib[mroute_address][source] = {}
+
+                match_mroute_flags = re.compile(r'Flags\:\s+([\w\s]+)$', re.M|re.DOTALL)
+                mroute_flags = match_mroute_flags.search(entry)
+                if mroute_flags:
+                    flags = mroute_flags.group(1).strip()
+                    mfib[mroute_address][source]['flags'] = flags.split()
+
+                match_sw_fw = re.compile(r'SW\sForwarding\:\s+([0-9\/]+)\,', re.M|re.DOTALL)
+                sw_fw = match_sw_fw.search(entry)
+                if sw_fw:
+                    sw_fwd = sw_fw.group(1).split('/')
+                    mfib[mroute_address][source]['sw_forwarding'] = {'pkt_count': sw_fwd[0],
+                                                                     'pps': sw_fwd[1],
+                                                                     'avg_pkt_size': sw_fwd[2],
+                                                                     'kbps': sw_fwd[3]
+                                                                    }
+
+                match_hw_fw = re.compile(r'HW\sForwarding\:\s+([0-9\/]+)\,', re.M|re.DOTALL)
+                hw_fw = match_hw_fw.search(entry)
+                if hw_fw:
+                    hw_fwd = hw_fw.group(1).split('/')
+                    mfib[mroute_address][source]['hw_forwarding'] = {'pkt_count': hw_fwd[0],
+                                                                     'pps': hw_fwd[1],
+                                                                     'avg_pkt_size': hw_fwd[2],
+                                                                     'kbps': hw_fwd[3]
+                                                                    }
+
+                match_interfaces = re.compile(r'HW\sForwarding\:[\ \w\/\,\:]+\n(.*)\n\s+Pkts', re.M|re.DOTALL)
+                interfaces = match_interfaces.search(entry)
+
+                line_id = 1
+                mfib[mroute_address][source]['outgoing_interfaces'] = []
+                for line in interfaces.group(1).splitlines():
+                    match_flags = re.split(r'Flags:\s+', line)
+                    if len(match_flags) > 1:
+                        flags = match_flags[1].split()
+                        interface = match_flags[0].strip().split(',')
+                        if line_id == 1:
+                            if len(interface) == 1:
+                                mfib[mroute_address][source]['incoming_interface'] = {'name': interface[0].strip(),
+                                                                                      'flags': flags}
+                            if len(interface) == 2:
+                                mfib[mroute_address][source]['incoming_interface'] = {'name': interface[0].strip(),
+                                                                                      'mdt': interface[1].strip(),
+                                                                                      'flags': flags}
+                        else:
+                            if len(interface) == 1:
+                                out_int_info = {'name': interface[0].strip(),
+                                                'flags': flags}
+                            if len(interface) == 2:
+                                out_int_info = {'name': interface[0].strip(),
+                                                'mdt': interface[1].strip(),
+                                                'flags': flags}
+                            mfib[mroute_address][source]['outgoing_interfaces'].append(out_int_info)
+                    line_id += 1
+                
+            except AttributeError:
+                continue
+
+        return mfib
+
+    def get_ip_mfib(self):
+        
+        command = "show ip mfib"
+        show_ip_mfib = self._send_command(command)
+
+        show_ip_mfib = show_ip_mfib.strip()
+
+        return self._parse_mfib_output(show_ip_mfib)
+
+    def get_ip_mfib_vrf(self, vrf_name):
+        
+        command = "show ip mfib vrf " + vrf_name
+        show_ip_mfib_vrf = self._send_command(command)
+
+        show_ip_mfib_vrf = show_ip_mfib_vrf.strip()
+
+        return self._parse_mfib_output(show_ip_mfib_vrf)
+
+    @staticmethod
+    def _parse_mfib_active_output(output):
+        
+        mfib_active = {}
+
+        try:
+            match_mcast_entry = re.compile(r'Group\:\s+', re.M|re.DOTALL)
+            mcast_entries = match_mcast_entry.split(output)
+        except AttributeError:
+            pass
+
+
+        for entry in mcast_entries:
+            try:
+                match_group = re.search(r'([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\n', entry)
+                if match_group:
+                    group = match_group.group(1).strip()
+
+                    mfib_active[group] = {}
+
+                    for line in entry.splitlines():
+                        if 'Source:' in line:
+                            source = line.split()[1].strip()
+                            mfib_active[group][source] = {}
+                        if 'RP-tree' in line:
+                            source = '*'
+                            mfib_active[group][source] = {}
+                        if 'SW Rate' in line:
+                            rates = line.split('SW Rate: ')[1].split(',')[0]
+                            rates_info = {}
+
+                            sec_rates = re.search(r'([0-9]+)\s+\w+\/([0-9]+).*', rates)
+                            rates_info['1_sec'] = {'pps': sec_rates.group(1), 'kbps': sec_rates.group(2)}
+                            mfib_active[group][source]['sw_rates'] = rates_info          
+                        if 'HW Rate' in line:
+                            rates = line.split('HW Rate: ')[1]
+                            rates_info = {}
+
+                            sec_rates = re.search(r'([0-9]+)\s+\w+\/([0-9]+).*', rates)
+                            rates_info['1_sec'] = {'pps': sec_rates.group(1), 'kbps': sec_rates.group(2)}
+                            mfib_active[group][source]['hw_rates'] = rates_info            
+            except AttributeError:
+                continue
+
+        return mfib_active
+
+    def get_ip_mfib_active(self):
+        
+        command = "show ip mfib active"
+        show_ip_mfib_active = self._send_command(command)
+
+        show_ip_mfib_active = show_ip_mfib_active.strip()
+
+        return self._parse_mfib_active_output(show_ip_mfib_active)
+
+    def get_ip_mfib_active_vrf(self, vrf_name):
+        
+        command = "show ip mfib vrf " + vrf_name + " active"
+        show_ip_mfib_active_vrf = self._send_command(command)
+
+        show_ip_mfib_active_vrf = show_ip_mfib_active_vrf.strip()
+
+        return self._parse_mfib_active_output(show_ip_mfib_active_vrf)
+    
+    ### End of source code by Tomas Kubina
